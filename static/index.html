@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini Agent</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e2e5ea;
+    --text: #1f2329; --muted: #8a919f; --accent: #4f6ef7; --accent-soft: #eef1fe;
+    --ok: #16a34a; --err: #dc2626;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--text); height: 100vh; display: flex; }
+
+  /* 侧栏 */
+  .sidebar { width: 240px; background: var(--panel); border-right: 1px solid var(--border);
+             display: flex; flex-direction: column; }
+  .sidebar h1 { font-size: 16px; padding: 16px; border-bottom: 1px solid var(--border); }
+  .sidebar h1 span { color: var(--muted); font-size: 12px; display: block; margin-top: 4px; font-weight: normal; }
+  #btn-new { margin: 12px; padding: 10px; border: none; border-radius: 8px;
+             background: var(--accent); color: #fff; cursor: pointer; font-size: 14px; }
+  #session-list { flex: 1; overflow-y: auto; padding: 0 8px; }
+  .session-item { padding: 10px; border-radius: 8px; cursor: pointer; font-size: 13px;
+                  margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .session-item:hover { background: var(--accent-soft); }
+  .session-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+  /* 主区 */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #chat { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 76%; padding: 10px 14px; border-radius: 12px; line-height: 1.6;
+         font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--border);
+                   border-bottom-left-radius: 4px; }
+
+  /* 工具调用面板（trace 可视化） */
+  details.tools { align-self: flex-start; max-width: 76%; font-size: 13px; }
+  details.tools summary { cursor: pointer; color: var(--muted); padding: 6px 10px;
+                          background: var(--panel); border: 1px dashed var(--border); border-radius: 8px; }
+  details.tools summary b { color: var(--accent); }
+  .tool-record { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+                 padding: 8px 10px; margin-top: 6px; }
+  .tool-record .name { font-weight: 600; }
+  .tool-record .status-ok { color: var(--ok); }
+  .tool-record .status-err { color: var(--err); }
+  .tool-record pre { margin-top: 6px; font-size: 12px; background: var(--bg);
+                     padding: 6px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+
+  /* 输入区 */
+  .input-bar { display: flex; gap: 10px; padding: 14px 24px; background: var(--panel);
+               border-top: 1px solid var(--border); }
+  #input { flex: 1; padding: 12px; border: 1px solid var(--border); border-radius: 10px;
+           font-size: 14px; outline: none; resize: none; height: 46px; }
+  #input:focus { border-color: var(--accent); }
+  #btn-send { padding: 0 22px; border: none; border-radius: 10px; background: var(--accent);
+              color: #fff; cursor: pointer; font-size: 14px; }
+  #btn-send:disabled { opacity: .5; cursor: not-allowed; }
+  label.steer { display: flex; align-items: center; gap: 5px; font-size: 12px;
+                color: var(--muted); cursor: pointer; user-select: none; }
+  .typing { color: var(--muted); font-size: 13px; align-self: flex-start; }
+</style>
+</head>
+<body>
+  <aside class="sidebar">
+    <h1>Mini Agent<span>从零实现的 Agent Runtime</span></h1>
+    <button id="btn-new">＋ 新建会话（独立窗口）</button>
+    <div id="session-list"></div>
+  </aside>
+
+  <div class="main">
+    <div id="chat"></div>
+    <div class="input-bar">
+      <textarea id="input" placeholder="输入消息，Enter 发送…（如：查北京天气并记个待办 / 3.5*12 等于多少）"></textarea>
+      <label class="steer" title="Agent 执行工具期间插入的转向消息（pi 风格 steering）">
+        <input type="checkbox" id="steer"> 插话
+      </label>
+      <button id="btn-send">发送</button>
+    </div>
+  </div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const chat = $("#chat"), input = $("#input"), btnSend = $("#btn-send");
+const KEY = "mini_agent_session_id";
+let sessionId = localStorage.getItem(KEY) || null;
+
+async function api(path, opts) {
+  const resp = await fetch(path, opts);
+  if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).detail || resp.statusText);
+  return resp.json();
+}
+
+function addMsg(role, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+function addToolPanel(records) {
+  if (!records || !records.length) return;
+  const details = document.createElement("details");
+  details.className = "tools";
+  const okCount = records.filter(r => r.status === "ok").length;
+  details.innerHTML = `<summary>🔧 工具调用 <b>${records.length}</b> 次（成功 ${okCount}）</summary>`;
+  for (const r of records) {
+    const div = document.createElement("div");
+    div.className = "tool-record";
+    const errClass = r.status === "ok" ? "status-ok" : "status-err";
+    div.innerHTML = `<span class="name">round ${r.round} · ${r.name}</span>
+      <span class="${errClass}">[${r.status}] ${r.duration_ms}ms</span>
+      <pre>参数: ${JSON.stringify(r.args)}\n结果: ${r.result}</pre>`;
+    details.appendChild(div);
+  }
+  chat.appendChild(details);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function renderHistory(messages) {
+  chat.innerHTML = "";
+  let pendingTools = [];
+  for (const m of messages) {
+    if (m.role === "user" && !m.content.startsWith("[用户插话]")) {
+      addMsg("user", m.content);
+    } else if (m.role === "user") {
+      addMsg("user", m.content);
+    } else if (m.role === "assistant" && m.tool_calls) {
+      pendingTools.push(...m.tool_calls);
+    } else if (m.role === "tool") {
+      const tc = pendingTools.find(t => t.id === m.tool_call_id);
+      if (tc) { addToolPanel([{ name: tc.function.name, args: safeParse(tc.function.arguments),
+        result: m.content, duration_ms: "-", round: "-", status: "history" }]); pendingTools = []; }
+    } else if (m.role === "assistant" && m.content) {
+      addMsg("assistant", m.content);
+    }
+  }
+}
+
+function safeParse(s) { try { return JSON.parse(s); } catch { return { raw: s }; } }
+
+async function refreshSessionList() {
+  const sessions = await api("/api/sessions");
+  const list = $("#session-list");
+  list.innerHTML = "";
+  for (const s of sessions) {
+    const div = document.createElement("div");
+    div.className = "session-item" + (s.session_id === sessionId ? " active" : "");
+    div.textContent = s.preview || s.session_id;
+    div.title = s.session_id;
+    div.onclick = () => switchSession(s.session_id);
+    list.appendChild(div);
+  }
+}
+
+async function switchSession(sid) {
+  sessionId = sid;
+  localStorage.setItem(KEY, sid);
+  try { renderHistory((await api(`/api/sessions/${sid}/history`)).messages); } catch {}
+  await refreshSessionList();
+}
+
+async function newSession() {
+  const { session_id } = await api("/api/sessions", { method: "POST" });
+  await switchSession(session_id);
+  chat.innerHTML = "";
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text || !sessionId) return;
+  input.value = "";
+  btnSend.disabled = true;
+
+  const steer = $("#steer").checked;
+  if (steer) {
+    // 插话：进 steering 队列，Agent 工具轮间注入（若 Agent 空闲则直接发送）
+    await api(`/api/sessions/${sessionId}/steer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text }),
+    });
+    addMsg("user", "[用户插话] " + text);
+    btnSend.disabled = false;
+    return;
+  }
+
+  addMsg("user", text);
+  const typing = document.createElement("div");
+  typing.className = "typing"; typing.textContent = "思考中…";
+  chat.appendChild(typing);
+
+  try {
+    const resp = await api("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, message: text }),
+    });
+    typing.remove();
+    addToolPanel(resp.tool_calls);
+    addMsg("assistant", resp.reply + (resp.truncated ? "\n（已达最大轮次，提前截断）" : ""));
+    await refreshSessionList();
+  } catch (e) {
+    typing.remove();
+    addMsg("assistant", "出错了: " + e.message);
+  } finally {
+    btnSend.disabled = false;
+    input.focus();
+  }
+}
+
+btnSend.onclick = send;
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("#btn-new").onclick = newSession;
+
+(async function init() {
+  await refreshSessionList();
+  if (sessionId) {
+    try { renderHistory((await api(`/api/sessions/${sessionId}/history`)).messages); return; } catch {}
+  }
+  await newSession();
+})();
+</script>
+</body>
+</html>
